@@ -138,6 +138,168 @@
     (should (string-search "Example:" entry))
     (should (string-search "(emacs-agent-searxng-search" entry))))
 
+(cl-defun emacs-agent-searxng-test--with-page
+    (body thunk &key (content-type "text/html; charset=utf-8")
+          (status 200) (coding 'utf-8) final-url)
+  "Call THUNK with a mocked HTTP response containing BODY.
+CONTENT-TYPE, STATUS, CODING and FINAL-URL describe the response."
+  (let ((response (generate-new-buffer " *searxng-test-page*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer response
+            (set-buffer-multibyte nil)
+            (when final-url
+              (setq-local url-current-object (url-generic-parse-url final-url)))
+            (insert (format "HTTP/1.1 %d Test\r\n" status))
+            (when content-type
+              (insert "Content-Type: " content-type "\r\n"))
+            (insert "\r\n" (encode-coding-string body coding)))
+          (prog1
+              (cl-letf (((symbol-function 'url-retrieve-synchronously)
+                         (lambda (_url silent inhibit-cookies timeout)
+                           (should silent)
+                           (should inhibit-cookies)
+                           (should (equal timeout emacs-agent-searxng-timeout))
+                           response))
+                        ((symbol-function 'url-retrieve)
+                         (lambda (&rest _) (ert-fail "Unexpected subresource request")))
+                        ((symbol-function 'url-queue-retrieve)
+                         (lambda (&rest _) (ert-fail "Unexpected queued request"))))
+                (funcall thunk))
+            (should-not (buffer-live-p response))))
+      (when (buffer-live-p response)
+        (kill-buffer response)))))
+
+(ert-deftest emacs-agent-searxng-fetch-html ()
+  (emacs-agent-searxng-test--with-page
+   (concat "<html><head><title>  Тест &amp; пример </title></head><body>"
+           "<header>Header noise</header><nav>Navigation noise</nav>"
+           "<main><h1>Heading</h1><p>Привет <a href='../docs'>Guide</a>.</p>"
+           "<ul><li>First item</li><li>Second item</li></ul>"
+           "<pre>  code\n    indent</pre>"
+           "<script>Script noise</script><style>Style noise</style>"
+           "<img src='/image.png'><iframe src='/frame'>Frame noise</iframe></main>"
+           "<footer>Footer noise</footer><p>Outside main</p></body></html>")
+   (lambda ()
+     (let ((current (current-buffer))
+           (result (emacs-agent-searxng-fetch "https://example.org/start")))
+       (should (eq current (current-buffer)))
+       (should (string-prefix-p
+                "Title: Тест & пример\nSource: https://example.org/articles/page\n"
+                result))
+       (dolist (text '("Heading" "Привет" "Guide" "First item" "Second item"
+                       "    indent" "https://example.org/docs" "Links:"))
+         (should (string-search text result)))
+       (dolist (text '("Header noise" "Navigation noise" "Script noise"
+                       "Style noise" "Frame noise" "Footer noise" "Outside main"))
+         (should-not (string-search text result)))
+       (should-not (text-properties-at 0 result))))
+   :final-url "https://example.org/articles/page"))
+
+(ert-deftest emacs-agent-searxng-fetch-article-and-body ()
+  (dolist (html '("<html><body><article>Article text</article><p>Other</p></body></html>"
+                  "<html><body><p>Article text</p></body></html>"))
+    (emacs-agent-searxng-test--with-page
+     html
+     (lambda ()
+       (let ((result (emacs-agent-searxng-fetch "https://example.org")))
+         (should (string-search "Article text" result))
+         (should-not (string-search "Other" result)))))))
+
+(ert-deftest emacs-agent-searxng-fetch-plain-text ()
+  (emacs-agent-searxng-test--with-page
+   "  Привет\n\n  Preserve indentation.\n"
+   (lambda ()
+     (should (equal (emacs-agent-searxng-fetch "https://example.org/readme")
+                    (concat "Title: https://example.org/readme\n"
+                            "Source: https://example.org/readme\n\n"
+                            "  Привет\n\n  Preserve indentation.\n"))))
+   :content-type "Text/Plain; Charset=windows-1251" :coding 'windows-1251))
+
+(ert-deftest emacs-agent-searxng-fetch-preformatted ()
+  (emacs-agent-searxng-test--with-page
+   "<html><body><pre>    first\n      second</pre></body></html>"
+   (lambda ()
+     (should (string-search "\n\n    first\n      second"
+                            (emacs-agent-searxng-fetch "https://example.org"))))))
+
+(ert-deftest emacs-agent-searxng-fetch-charsets ()
+  (emacs-agent-searxng-test--with-page
+   "Привет 😀"
+   (lambda ()
+     (should (string-suffix-p "Привет 😀"
+                              (emacs-agent-searxng-fetch "https://example.org"))))
+   :content-type "text/plain")
+  (dolist (meta '("<meta charset='windows-1251'>"
+                  "<meta content='text/html; charset=windows-1251' http-equiv='Content-Type'>"))
+    (emacs-agent-searxng-test--with-page
+     (concat "<html><head>" meta "</head><body><p>Привет</p></body></html>")
+     (lambda ()
+       (should (string-search "Привет"
+                              (emacs-agent-searxng-fetch "https://example.org"))))
+     :content-type "text/html" :coding 'windows-1251)))
+
+(ert-deftest emacs-agent-searxng-fetch-links ()
+  (emacs-agent-searxng-test--with-page
+   (concat "<html><head><base href='https://docs.example.org/manual/'></head>"
+           "<body><p><a href='intro'>Intro</a> and <a href='intro'>Again</a>. "
+           "<a href='https://other.example.org'>Other</a>. "
+           "<a href='javascript:alert(1)'>Unsafe</a>.</p></body></html>")
+   (lambda ()
+     (let ((result (emacs-agent-searxng-fetch "https://example.org")))
+       (should (string-search "Intro [1]" result))
+       (should (string-search "Again [1]" result))
+       (should (string-search "[1] https://docs.example.org/manual/intro" result))
+       (should (string-search "[2] https://other.example.org" result))
+       (should-not (string-search "javascript:" result))))))
+
+(ert-deftest emacs-agent-searxng-fetch-no-libxml ()
+  (emacs-agent-searxng-test--with-page
+   "<p>Some text</p>"
+   (lambda ()
+     (cl-letf (((symbol-function 'libxml-available-p) (lambda () nil)))
+       (let ((err (should-error (emacs-agent-searxng-fetch "https://example.org"))))
+         (should (string-match-p "libxml" (error-message-string err))))))))
+
+(ert-deftest emacs-agent-searxng-fetch-truncation ()
+  (emacs-agent-searxng-test--with-page
+   (make-string 1000 ?x)
+   (lambda ()
+     (let ((result (emacs-agent-searxng-fetch "https://example.org" :max-length 100)))
+       (should (= (length (car (split-string result "\n\n\\[Output truncated"))) 100))
+       (should (string-suffix-p "[Output truncated at 100 characters]" result))))
+   :content-type "text/plain"))
+
+(ert-deftest emacs-agent-searxng-fetch-argument-errors ()
+  (cl-letf (((symbol-function 'url-retrieve-synchronously)
+             (lambda (&rest _) (ert-fail "Invalid arguments must not cause a request"))))
+    (dolist (url '(nil "" "file:///etc/passwd" "ftp://example.org" "https://" "x"))
+      (should-error (emacs-agent-searxng-fetch url)))
+    (dolist (limit '(0 -1 1.5 "100" nil))
+      (should-error (emacs-agent-searxng-fetch "https://example.org" :max-length limit)))))
+
+(ert-deftest emacs-agent-searxng-fetch-response-errors ()
+  (dolist (case '(("text/html" 404 "Not found" "HTTP 404")
+                  ("application/pdf" 200 "%PDF" "Unsupported content type")
+                  ("image/png" 200 "binary" "Unsupported content type")
+                  (nil 200 "unknown" "Unsupported content type")
+                  ("text/html" 200 "<html><body><script>JS only</script></body></html>"
+                   "no readable text")))
+    (emacs-agent-searxng-test--with-page
+     (nth 2 case)
+     (lambda ()
+       (let ((err (should-error (emacs-agent-searxng-fetch "https://example.org"))))
+         (should (string-match-p (nth 3 case) (error-message-string err)))))
+     :content-type (nth 0 case) :status (nth 1 case)))
+  (cl-letf (((symbol-function 'url-retrieve-synchronously) (lambda (&rest _) nil)))
+    (should-error (emacs-agent-searxng-fetch "https://example.org"))))
+
+(ert-deftest emacs-agent-searxng-fetch-helper-registered ()
+  (let ((entry (gethash 'emacs-agent-searxng-fetch emacs-agent-user-helpers--registry)))
+    (should (stringp entry))
+    (should (string-search "emacs-agent-searxng-fetch" entry))
+    (should (string-search "Example:" entry))))
+
 (ert-deftest emacs-agent-searxng-live-search ()
   "Query the configured instance; skipped unless EMACS_AGENT_SEARXNG_TEST=1."
   (unless (getenv "EMACS_AGENT_SEARXNG_TEST")

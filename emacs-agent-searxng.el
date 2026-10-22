@@ -8,8 +8,8 @@
 ;; Ordinary Lisp helper for web search through a SearXNG instance, called
 ;; by the agent through eval_elisp.  It is not an additional tool and grants
 ;; no permissions beyond the unrestricted evaluator it runs in.  Loading this
-;; file registers `emacs-agent-searxng-search' in the user helper registry
-;; so new agent inputs see its compact description.
+;; file registers search and readable-page fetch helpers in the user helper
+;; registry so new agent inputs see their compact descriptions.
 
 ;;; Code:
 (require 'cl-lib)
@@ -17,6 +17,9 @@
 (require 'subr-x)
 (require 'url)
 (require 'url-util)
+(require 'dom)
+(require 'shr)
+(require 'mail-parse)
 (require 'emacs-agent-user-helpers)
 
 (defcustom emacs-agent-searxng-url
@@ -28,7 +31,7 @@ is set in the Emacs environment."
   :group 'emacs-agent)
 
 (defcustom emacs-agent-searxng-timeout 15
-  "Seconds to wait for a SearXNG response before failing."
+  "Seconds to wait for a search or page-fetch response before failing."
   :type 'integer
   :group 'emacs-agent)
 
@@ -198,6 +201,169 @@ URLs in answers built from them."
  :returns "A numbered plain-text list of title, URL (source engine) and snippet for up to LIMIT results, or a one-line notice when nothing matched."
  :constraints "Synchronous network request to emacs-agent-searxng-url (SEARXNG_URL environment variable, default http://172.16.3.65:8180); no editor or file changes. Signals an error when the instance is unreachable or returns invalid JSON. Cite result URLs in answers built from them."
  :example "(emacs-agent-searxng-search \"SearXNG JSON API\" :language \"en\" :limit 3)")
+
+(defun emacs-agent-searxng--page-response (url)
+  "Retrieve URL and return its final URL, content type and body as a plist."
+  (let ((buffer (url-retrieve-synchronously
+                 url t t emacs-agent-searxng-timeout)))
+    (unless buffer
+      (error "Fetch request failed: no response from %s" url))
+    (with-current-buffer buffer
+      (unwind-protect
+          (let ((case-fold-search t) status header-end content-type)
+            (goto-char (point-min))
+            (unless (looking-at "HTTP/[0-9.]+ +\\([0-9]+\\)")
+              (error "Fetch returned an invalid HTTP response"))
+            (setq status (string-to-number (match-string 1)))
+            (unless (<= 200 status 299)
+              (error "Fetch returned HTTP %d for %s" status url))
+            (unless (re-search-forward "\r?\n\r?\n" nil t)
+              (error "Fetch returned incomplete HTTP headers"))
+            (setq header-end (point))
+            (goto-char (point-min))
+            (when (re-search-forward "^Content-Type:[ \t]*\\([^\r\n]+\\)"
+                                     header-end t)
+              (setq content-type (string-trim (match-string-no-properties 1))))
+            (list :url (if (and (boundp 'url-current-object) url-current-object)
+                           (url-recreate-url url-current-object)
+                         url)
+                  :content-type content-type
+                  :body (buffer-substring-no-properties header-end (point-max))))
+        (kill-buffer buffer)))))
+
+(defun emacs-agent-searxng--decode-page (body content-type html)
+  "Decode BODY using CONTENT-TYPE, HTML metadata or UTF-8, in that order."
+  (let ((charset (cdr (assq 'charset (cdr (mail-header-parse-content-type
+                                         content-type)))))
+        (case-fold-search t)
+        (position 0))
+    (when (and html (null charset))
+      (while (and (null charset) (string-match "<meta\\b[^>]*>" body position))
+        (let ((tag (match-string 0 body)))
+          (setq position (match-end 0))
+          (when (string-match
+                 "\\bcharset[ \t\r\n]*=[ \t\r\n]*[\"']?\\([^ \t\r\n\"'/>;]+\\)"
+                 tag)
+            (setq charset (match-string 1 tag))))))
+    (let ((coding (if charset (intern (downcase charset)) 'utf-8)))
+      (unless (coding-system-p coding)
+        (error "Unsupported page charset: %s" charset))
+      (if (multibyte-string-p body) body
+        (decode-coding-string body coding)))))
+
+(defun emacs-agent-searxng--page-links ()
+  "Turn SHR link properties in the current buffer into numbered references."
+  (let ((position (point-min)) links references)
+    (while (< position (point-max))
+      (let ((target (get-text-property position 'shr-url))
+            (end (next-single-property-change position 'shr-url nil (point-max))))
+        (when (and (stringp target) (string-match-p "\\`https?://" target))
+          (let ((index (cl-position target links :test #'equal)))
+            (unless index
+              (setq index (length links)
+                    links (append links (list target))))
+            (push (cons end (1+ index)) references)))
+        (setq position end)))
+    ;; Insert backwards so earlier positions remain valid.
+    (dolist (reference references)
+      (goto-char (car reference))
+      (insert (format " [%d]" (cdr reference))))
+    (when links
+      (goto-char (point-max))
+      (insert "\n\nLinks:\n")
+      (cl-loop for target in links for index from 1
+               do (insert (format "[%d] %s\n" index target))))))
+
+(defun emacs-agent-searxng--readable-html (html url)
+  "Render HTML from URL as a plist containing :title and :text."
+  (unless (and (fboundp 'libxml-parse-html-region) (libxml-available-p))
+    (error "HTML fetching requires Emacs built with libxml2 support"))
+  (let ((dom (with-temp-buffer
+               (insert html)
+               (libxml-parse-html-region (point-min) (point-max)))))
+    (unless dom
+      (error "Unable to parse HTML page"))
+    (let* ((title (emacs-agent-searxng--clean
+                   (dom-texts (car (dom-by-tag dom 'title)) " ") 500))
+           (base (dom-attr (car (dom-by-tag dom 'base)) 'href))
+           (base-url (if base (url-expand-file-name base url) url)))
+      (dolist (tag '(script style nav header footer aside noscript iframe
+                           object embed form link meta))
+        (dolist (node (dom-by-tag dom tag))
+          (dom-remove-node dom node)))
+      (let ((content (or (car (dom-by-tag dom 'main))
+                         (car (dom-by-tag dom 'article))
+                         (car (dom-by-tag dom 'body)) dom))
+            (shr-inhibit-images t)
+            (shr-use-xwidgets-for-media nil)
+            (shr-use-fonts nil)
+            (shr-use-colors nil)
+            (shr-width 80)
+            (shr-external-rendering-functions nil)
+            (shr-url-transformer #'identity))
+        (list :title title
+              :text (with-temp-buffer
+                      (shr-insert-document `(base ((href . ,base-url)) ,content))
+                      (emacs-agent-searxng--page-links)
+                      (string-trim (buffer-substring-no-properties
+                                    (point-min) (point-max))
+                                   "[\r\n]+" "[\r\n]+")))))))
+
+(cl-defun emacs-agent-searxng-fetch (url &key (max-length 20000))
+  "Fetch an HTTP(S) URL as readable plain text without external programs.
+HTML is rendered with built-in libxml and SHR, preferring main or article
+content over the full body.  Plain text is also supported.  Other content
+types (including PDF) signal an error.  JavaScript is never executed and
+images and other page resources are not downloaded.
+
+Return a string containing Title, Source (the final URL after redirects),
+page text and numbered links.  MAX-LENGTH is a positive integer bounding
+the entire output, excluding an appended truncation notice.  This limits
+output only, not the downloaded response size.  The synchronous request
+uses `emacs-agent-searxng-timeout' and changes no user buffers or files.
+Signals an error for failed requests or pages with no readable text.
+Cite Source or the link URLs in answers built from the fetched text."
+  (unless (stringp url)
+    (error "URL must be an HTTP(S) URL string"))
+  (setq url (string-trim (substring-no-properties url)))
+  (let ((parsed (url-generic-parse-url url)))
+    (unless (and (member (url-type parsed) '("http" "https"))
+                 (url-host parsed) (not (string-empty-p (url-host parsed)))
+                 (not (string-match-p "[[:space:][:cntrl:]]" url)))
+      (error "URL must be an HTTP(S) URL with a host")))
+  (unless (and (integerp max-length) (> max-length 0))
+    (error "MAX-LENGTH must be a positive integer"))
+  (let* ((response (emacs-agent-searxng--page-response url))
+         (source (plist-get response :url))
+         (content-type (plist-get response :content-type))
+         (mime (and content-type
+                    (downcase (string-trim (car (split-string content-type ";"))))))
+         (html (member mime '("text/html" "application/xhtml+xml"))))
+    (unless (or html (equal mime "text/plain"))
+      (error "Unsupported content type: %s (expected HTML or plain text)"
+             (or content-type "missing Content-Type")))
+    (let* ((body (emacs-agent-searxng--decode-page
+                  (plist-get response :body) content-type html))
+           (page (if html (emacs-agent-searxng--readable-html body source)
+                   (list :text body)))
+           (text (plist-get page :text))
+           (title (plist-get page :title)))
+      (when (string-empty-p (string-trim text))
+        (error "Page contains no readable text; JavaScript is not executed"))
+      (let ((output (format "Title: %s\nSource: %s\n\n%s"
+                            (if (or (null title) (string-empty-p title)) source title)
+                            source text)))
+        (if (<= (length output) max-length)
+            output
+          (concat (substring output 0 max-length)
+                  (format "\n\n[Output truncated at %d characters]" max-length)))))))
+
+(emacs-agent-register-helper
+ 'emacs-agent-searxng-fetch
+ :description "Fetch a web page as readable text; use it to read a URL found by search."
+ :returns "Plain text with Title, Source (final URL), page text and numbered links; an explicit notice marks truncation."
+ :constraints "HTTP(S), HTML/plain text only. Synchronous request using emacs-agent-searxng-timeout; no user buffer or file changes. Requires libxml for HTML. No JavaScript or subresource downloads. MAX-LENGTH (default 20000) bounds output excluding the truncation notice, not download size. Unsupported types, HTTP failures and empty pages signal errors. Cite source URLs."
+ :example "(emacs-agent-searxng-fetch \"https://example.org/article\" :max-length 20000)")
 
 (provide 'emacs-agent-searxng)
 ;;; emacs-agent-searxng.el ends here
