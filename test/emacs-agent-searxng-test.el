@@ -29,6 +29,13 @@
        (should raised)
        (should (string-match-p "http or https" (error-message-string raised)))))))
 
+(ert-deftest emacs-agent-searxng-url-unicode ()
+  (let ((emacs-agent-searxng-url "https://searxng.example"))
+    (should (equal (emacs-agent-searxng--url " привет café 😀 " :language "ru")
+                   (concat "https://searxng.example/search?q="
+                           "%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82"
+                           "%20caf%C3%A9%20%F0%9F%98%80&format=json&language=ru")))))
+
 (ert-deftest emacs-agent-searxng-url-trailing-slash ()
   (emacs-agent-searxng-test--with-url
    "http://searxng.example:8080/"
@@ -65,6 +72,55 @@
                  "No SearXNG results for nothing."))
   (should (equal (emacs-agent-searxng--format "nothing" (json-read-from-string "{\"results\":[]}") 5)
                  "No SearXNG results for nothing.")))
+
+(ert-deftest emacs-agent-searxng-search-http-response ()
+  "Parse a response with point at its end, regardless of JSON settings."
+  (dolist (settings '((alist vector symbol)
+                      (hash-table vector string)
+                      (alist list symbol)
+                      (plist list keyword)))
+    (let ((json-object-type (nth 0 settings))
+          (json-array-type (nth 1 settings))
+          (json-key-type (nth 2 settings))
+          (response (generate-new-buffer " *searxng-test-response*")))
+      (unwind-protect
+          (progn
+            (with-current-buffer response
+              (set-buffer-multibyte nil)
+              (insert "HTTP/1.1 200 OK\nContent-Type: application/json\n\n"
+                      (encode-coding-string
+                       (concat "{\"results\":[{\"url\":\"https://example.org\","
+                               "\"title\":\"Тест\",\"content\":\"Snippet\",\"engine\":\"test\"}]}")
+                       'utf-8))
+              (goto-char (point-max)))
+            (cl-letf (((symbol-function 'url-retrieve-synchronously)
+                       (lambda (&rest _) response)))
+              (should (equal (emacs-agent-searxng-search "q")
+                             (concat "SearXNG results for q:\n\n1. Тест\n"
+                                     "   https://example.org (test)\n   Snippet"))))
+            (should-not (buffer-live-p response))
+            (should (equal (list json-object-type json-array-type json-key-type)
+                           settings)))
+        (when (buffer-live-p response)
+          (kill-buffer response))))))
+
+(ert-deftest emacs-agent-searxng-payload-response-errors ()
+  "HTTP and JSON errors must still release the response buffer."
+  (dolist (case '(("HTTP/1.1 403 Forbidden\n\nForbidden" "HTTP 403")
+                  ("HTTP/1.1 200 OK\n\nnot-json" "invalid JSON")))
+    (let ((response (generate-new-buffer " *searxng-test-response*")))
+      (unwind-protect
+          (progn
+            (with-current-buffer response
+              (insert (car case)))
+            (cl-letf (((symbol-function 'url-retrieve-synchronously)
+                       (lambda (&rest _) response)))
+              (let ((err (should-error
+                          (emacs-agent-searxng--payload "http://example.org/search"))))
+                (should (string-match-p (cadr case) (error-message-string err)))))
+            (should-not (buffer-live-p response)))
+        (when (buffer-live-p response)
+          (kill-buffer response))))))
 
 (ert-deftest emacs-agent-searxng-search-argument-errors ()
   (should-error (emacs-agent-searxng-search ""))

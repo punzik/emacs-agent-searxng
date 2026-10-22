@@ -46,13 +46,14 @@ is set in the Emacs environment."
       (substring text 0 max-length))))
 
 (defun emacs-agent-searxng--encode (text)
-  "Percent-encode TEXT for use in a URL query parameter."
+  "Percent-encode the UTF-8 bytes of TEXT for a URL query parameter."
   (mapconcat
    (lambda (ch)
      (if (member ch emacs-agent-searxng--url-safe-chars)
          (string ch)
        (format "%%%02X" ch)))
-   (append (string-trim (substring-no-properties (or text ""))) nil) ""))
+   (append (encode-coding-string
+            (string-trim (substring-no-properties (or text ""))) 'utf-8) nil) ""))
 
 (defun emacs-agent-searxng--endpoint (base)
   "Return the SearXNG /search endpoint for instance BASE."
@@ -111,8 +112,17 @@ is set in the Emacs environment."
               (error "SearXNG returned HTTP %d: %s"
                      status
                      (substring-no-properties (substring body 0 (min 300 (length body))))))
+            (unless enable-multibyte-characters
+              (setq body (decode-coding-string body 'utf-8))
+              (erase-buffer)
+              (set-buffer-multibyte t)
+              (insert body))
+            (goto-char (point-min))
             (setq result (condition-case err
-                             (json-read)
+                             (let ((json-object-type 'alist)
+                                   (json-array-type 'vector)
+                                   (json-key-type 'symbol))
+                               (json-read))
                            (error (error "SearXNG returned invalid JSON: %s"
                                          (error-message-string err))))))
         (kill-buffer buffer)))
