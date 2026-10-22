@@ -48,6 +48,36 @@ is set in the Emacs environment."
         text
       (substring text 0 max-length))))
 
+(defun emacs-agent-searxng--unescape (text)
+  "Decode HTML entities in TEXT once, preserving unknown or invalid ones.
+Numeric references support decimal and hexadecimal Unicode code points.
+Common named entities work without libxml; other named entities use its
+HTML parser when available.  Nil means empty text."
+  (let ((case-fold-search nil))
+    (replace-regexp-in-string
+     "&\\(?:#[xX][0-9a-fA-F]+\\|#[0-9]+\\|[A-Za-z][A-Za-z0-9]*\\);"
+     (lambda (entity)
+       (let* ((name (substring entity 1 -1))
+              (value (if (string-prefix-p "#" name)
+                         (if (memq (aref name 1) '(?x ?X))
+                             (string-to-number (substring name 2) 16)
+                           (string-to-number (substring name 1)))
+                       (or (cdr (assoc name '(("amp" . 38) ("lt" . 60)
+                                              ("gt" . 62) ("quot" . 34)
+                                              ("apos" . 39) ("nbsp" . 160))))
+                           (when (and (fboundp 'libxml-parse-html-region)
+                                      (libxml-available-p))
+                             (with-temp-buffer
+                               (insert "<p>" entity "</p>")
+                               (dom-texts (libxml-parse-html-region
+                                           (point-min) (point-max)) "")))))))
+         (cond ((stringp value) value)
+               ((and (integerp value) (<= 1 value #x10ffff)
+                     (not (<= #xd800 value #xdfff)))
+                (char-to-string value))
+               (t entity))))
+     (or text "") t t)))
+
 (defun emacs-agent-searxng--encode (text)
   "Percent-encode the UTF-8 bytes of TEXT for a URL query parameter."
   (mapconcat
@@ -68,7 +98,6 @@ is set in the Emacs environment."
 (cl-defun emacs-agent-searxng--url (query &key categories language)
   "Build the SearXNG JSON search URL for QUERY against `emacs-agent-searxng-url'."
   (let* ((endpoint (emacs-agent-searxng--endpoint emacs-agent-searxng-url))
-         (sep (if (string-match-p "?" endpoint) "&" "?"))
          (parts (list "format=json" (concat "q=" (emacs-agent-searxng--encode query)))))
     (when categories
       (push (concat "categories="
@@ -78,7 +107,7 @@ is set in the Emacs environment."
     (when language
       (push (concat "language=" (emacs-agent-searxng--encode language))
             parts))
-    (concat endpoint sep (mapconcat #'identity (nreverse parts) "&"))))
+    (concat endpoint "?" (mapconcat #'identity (nreverse parts) "&"))))
 
 (defun emacs-agent-searxng--payload (url)
   "Fetch URL synchronously and return the decoded SearXNG JSON payload."
@@ -132,9 +161,9 @@ is set in the Emacs environment."
     result))
 
 (defun emacs-agent-searxng--field (record key)
-  "Return KEY from decoded JSON object RECORD, an alist or a hash table depending
-on the Emacs version's json-read default.  Alist keys may be strings or
-symbols."
+  "Return string KEY from an alist or hash table RECORD.
+Alist keys may be strings or symbols.  The search JSON parser explicitly
+produces alists with symbol keys."
   (if (hash-table-p record)
       (gethash key record)
     (or (assoc-default key record)
@@ -150,9 +179,9 @@ symbols."
                          collect result))
          (lines (cl-loop for result in valid for index from 1 to limit
                          collect (let ((item-url (emacs-agent-searxng--clean (emacs-agent-searxng--field result "url") 2000)))
-                                   (let ((title (or (emacs-agent-searxng--clean (emacs-agent-searxng--field result "title") 500)
+                                   (let ((title (or (emacs-agent-searxng--clean (emacs-agent-searxng--unescape (emacs-agent-searxng--field result "title")) 500)
                                                     item-url))
-                                         (snippet (emacs-agent-searxng--clean (emacs-agent-searxng--field result "content") 1500))
+                                         (snippet (emacs-agent-searxng--clean (emacs-agent-searxng--unescape (emacs-agent-searxng--field result "content")) 1500))
                                          (engine (emacs-agent-searxng--clean (emacs-agent-searxng--field result "engine") 100)))
                                      (format "%d. %s\n   %s%s%s"
                                              index title item-url

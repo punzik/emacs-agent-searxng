@@ -67,6 +67,47 @@
                            "   https://c.example (brave)\n"
                            "   Third snippet")))))
 
+(ert-deftest emacs-agent-searxng-unescape-common-and-numeric ()
+  "Basic decoding must also work in Emacs without libxml support."
+  (cl-letf (((symbol-function 'libxml-available-p) (lambda () nil)))
+    (should (equal (emacs-agent-searxng--unescape
+                    "&amp; &lt; &gt; &quot; &apos; &nbsp; &#39; &#x27; &#X1F600; &#1040;")
+                   "& < > \" ' \u00a0 ' ' 😀 А"))
+    (should (equal (emacs-agent-searxng--unescape nil) ""))))
+
+(ert-deftest emacs-agent-searxng-unescape-named ()
+  (unless (and (fboundp 'libxml-parse-html-region) (libxml-available-p))
+    (ert-skip "Extended named entities require libxml"))
+  (should (equal (emacs-agent-searxng--unescape "&copy; &eacute; &mdash;")
+                 "© é —")))
+
+(ert-deftest emacs-agent-searxng-unescape-single-pass ()
+  (let ((text "&amp;lt; &amp;#39; &unknown; &#0; &#xD800; &#x110000; &#xZZ; <b>text</b>"))
+    (should (equal (emacs-agent-searxng--unescape text)
+                   "&lt; &#39; &unknown; &#0; &#xD800; &#x110000; &#xZZ; <b>text</b>"))))
+
+(ert-deftest emacs-agent-searxng-format-entities ()
+  (let ((payload '((results . [((url . "https://example.org/?a=1&amp;b=2")
+                                (title . "A &amp; B &lt;tag&gt;")
+                                (content . "curl &#x27;?q=x&amp;format=json&#39;")
+                                (engine . "test"))]))))
+    (should (equal (emacs-agent-searxng--format "q" payload 1)
+                   (concat "SearXNG results for q:\n\n"
+                           "1. A & B <tag>\n"
+                           "   https://example.org/?a=1&amp;b=2 (test)\n"
+                           "   curl '?q=x&format=json'")))))
+
+(ert-deftest emacs-agent-searxng-format-entity-limits ()
+  "Bound visible characters, not the encoded entity spelling."
+  (let ((payload `((results . [((url . "https://example.org")
+                                (title . ,(apply #'concat (make-list 501 "&amp;")))
+                                (content . ,(apply #'concat (make-list 1501 "&#39;")))
+                                (engine . "test"))]))))
+    (should (equal (emacs-agent-searxng--format "q" payload 1)
+                   (concat "SearXNG results for q:\n\n1. " (make-string 500 ?&)
+                           "\n   https://example.org (test)\n   "
+                           (make-string 1500 ?\'))))))
+
 (ert-deftest emacs-agent-searxng-format-empty ()
   (should (equal (emacs-agent-searxng--format "nothing" (json-read-from-string "{}") 5)
                  "No SearXNG results for nothing."))
