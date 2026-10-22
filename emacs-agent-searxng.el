@@ -23,7 +23,7 @@
 (require 'emacs-agent-user-helpers)
 
 (defcustom emacs-agent-searxng-url
-  (or (getenv "SEARXNG_URL") "http://172.16.3.65:8180")
+  (or (getenv "SEARXNG_URL") "http://localhost:8080")
   "Base URL of the SearXNG instance, such as \"http://localhost:8080\".
 The environment variable SEARXNG_URL wins over the built-in default when it
 is set in the Emacs environment."
@@ -228,7 +228,7 @@ URLs in answers built from them."
  'emacs-agent-searxng-search
  :description "Web search through the configured SearXNG instance; use it for current web information or external documentation not available locally."
  :returns "A numbered plain-text list of title, URL (source engine) and snippet for up to LIMIT results, or a one-line notice when nothing matched."
- :constraints "Synchronous network request to emacs-agent-searxng-url (SEARXNG_URL environment variable, default http://172.16.3.65:8180); no editor or file changes. Signals an error when the instance is unreachable or returns invalid JSON. Cite result URLs in answers built from them."
+ :constraints "Synchronous network request to emacs-agent-searxng-url (SEARXNG_URL environment variable, default http://localhost:8080); no editor or file changes. Signals an error when the instance is unreachable or returns invalid JSON. Cite result URLs in answers built from them."
  :example "(emacs-agent-searxng-search \"SearXNG JSON API\" :language \"en\" :limit 3)")
 
 (defun emacs-agent-searxng--page-response (url)

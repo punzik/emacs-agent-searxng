@@ -1,6 +1,6 @@
 # emacs-agent-searxng
 
-Web-search and readable-page helpers for [emacs-agent](../emacs-agent).
+Web-search and readable-page helpers for [emacs-agent](https://github.com/punzik/emacs-agent).
 Search uses a [SearXNG](https://docs.searxng.org/) instance; page fetching
 connects directly to the requested website.
 
@@ -14,7 +14,7 @@ No new tool, permission or keybinding is added.
 ## Requirements
 
 - Emacs 28.1+ (tested with 30.2)
-- `emacs-agent` on the load-path (for `emacs-agent-user-helpers`)
+- [emacs-agent](https://github.com/punzik/emacs-agent) on the load-path (for `emacs-agent-user-helpers`)
 - For search: a reachable SearXNG instance with the JSON format enabled
   (`formats: [html, json]` in `settings.yml`)
 - For HTML fetching: Emacs built with libxml2 support (`(libxml-available-p)`)
@@ -23,8 +23,8 @@ No new tool, permission or keybinding is added.
 ## Usage
 
 ```elisp
-(add-to-list 'load-path "/path/to/emacs-ai-agent/emacs-agent")
-(add-to-list 'load-path "/path/to/emacs-ai-agent/emacs-agent-searxng")
+(add-to-list 'load-path "/path/to/emacs-agent")
+(add-to-list 'load-path "/path/to/emacs-agent-searxng")
 (require 'emacs-agent-searxng)
 ```
 
@@ -75,7 +75,7 @@ Fetching is independent of SearXNG and needs no running search instance.
 ## Configuration
 
 - `emacs-agent-searxng-url` — SearXNG base URL. Default: the
-  `SEARXNG_URL` environment variable, else `http://172.16.3.65:8180`.
+  `SEARXNG_URL` environment variable, else `http://localhost:8080`.
 - `emacs-agent-searxng-timeout` — response timeout for both search and page
   fetching, in seconds (default 15).
 
